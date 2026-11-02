@@ -1493,7 +1493,9 @@ impl<T> StoreContextMut<'_, T> {
                     // performance issues, this could be optimized such that we
                     // only yield periodically (e.g. for batches of low priority
                     // items) and not for each and every idividual item.
-                    if low_priority {
+                    // Stall-driving must not yield with the store checked out: an
+                    // embedder may synchronously re-enter it from another task.
+                    if low_priority && !matches!(idle, IdleBehavior::Return) {
                         dispose.store.0.yield_now().await
                     }
 
