@@ -997,6 +997,22 @@ impl<T> Store<T> {
         self.as_context_mut().run_concurrent(fun).await
     }
 
+    /// Drive this store's component event loop until no component or host work is
+    /// currently runnable.
+    ///
+    /// Pending tasks waiting on external futures are preserved. Their presence is
+    /// not an error or deadlock, and a later call can resume them when they wake.
+    pub async fn drive_until_stalled(&mut self) -> Result<()>
+    where
+        T: Send + 'static,
+    {
+        ensure!(
+            self.as_context().0.concurrency_support(),
+            "cannot use `drive_until_stalled` when Config::concurrency_support disabled",
+        );
+        self.as_context_mut().drive_until_stalled().await
+    }
+
     #[doc(hidden)]
     pub fn assert_concurrent_state_empty(&mut self) {
         self.as_context_mut().assert_concurrent_state_empty();
@@ -1014,6 +1030,13 @@ impl<T> Store<T> {
     {
         self.as_context_mut().spawn(task)
     }
+}
+
+#[derive(Clone, Copy)]
+enum IdleBehavior {
+    Wait,
+    Trap,
+    Return,
 }
 
 impl<T> StoreContextMut<'_, T> {
@@ -1191,7 +1214,10 @@ impl<T> StoreContextMut<'_, T> {
             self.0.concurrency_support(),
             "cannot use `run_concurrent` when Config::concurrency_support disabled",
         );
-        self.do_run_concurrent(fun, false).await
+        match self.do_run_concurrent(fun, IdleBehavior::Wait).await? {
+            Some(value) => Ok(value),
+            None => unreachable!("wait mode cannot return stalled"),
+        }
     }
 
     pub(super) async fn run_concurrent_trap_on_idle<R>(
@@ -1201,14 +1227,29 @@ impl<T> StoreContextMut<'_, T> {
     where
         T: Send + 'static,
     {
-        self.do_run_concurrent(fun, true).await
+        match self.do_run_concurrent(fun, IdleBehavior::Trap).await? {
+            Some(value) => Ok(value),
+            None => unreachable!("trap mode cannot return stalled"),
+        }
+    }
+
+    async fn drive_until_stalled(self) -> Result<()>
+    where
+        T: Send + 'static,
+    {
+        self.do_run_concurrent(
+            async |_| future::pending::<()>().await,
+            IdleBehavior::Return,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn do_run_concurrent<R>(
         mut self,
         fun: impl AsyncFnOnce(&Accessor<T>) -> R,
-        trap_on_idle: bool,
-    ) -> Result<R>
+        idle: IdleBehavior,
+    ) -> Result<Option<R>>
     where
         T: Send + 'static,
     {
@@ -1244,20 +1285,17 @@ impl<T> StoreContextMut<'_, T> {
         dropper
             .store
             .as_context_mut()
-            .poll_until(future, trap_on_idle)
+            .poll_until(future, idle)
             .await
     }
 
-    /// Run this store's event loop.
-    ///
-    /// The returned future will resolve when the specified future completes or,
-    /// if `trap_on_idle` is true, when the event loop can't make further
-    /// progress.
+    /// The returned future resolves when the specified future completes or the
+    /// event loop reaches the behavior's idle boundary.
     async fn poll_until<R>(
         mut self,
         mut future: Pin<&mut impl Future<Output = R>>,
-        trap_on_idle: bool,
-    ) -> Result<R>
+        idle: IdleBehavior,
+    ) -> Result<Option<R>>
     where
         T: Send + 'static,
     {
@@ -1295,6 +1333,7 @@ impl<T> StoreContextMut<'_, T> {
 
             enum PollResult<R> {
                 Complete(R),
+                Stalled,
                 ProcessWork {
                     ready: Vec<WorkItem>,
                     low_priority: bool,
@@ -1374,15 +1413,10 @@ impl<T> StoreContextMut<'_, T> {
                             // there are no remaining work items, _and_
                             // the future we were passed as an argument
                             // still hasn't completed.
-                            if trap_on_idle {
-                                // `trap_on_idle` is true, so we exit
-                                // immediately.
-                                Poll::Ready(Err(Trap::AsyncDeadlock.into()))
-                            } else {
-                                // `trap_on_idle` is false, so we assume
-                                // that future will wake up and give us
-                                // more work to do when it's ready to.
-                                Poll::Pending
+                            match idle {
+                                IdleBehavior::Trap => Poll::Ready(Err(Trap::AsyncDeadlock.into())),
+                                IdleBehavior::Wait => Poll::Pending,
+                                IdleBehavior::Return => Poll::Ready(Ok(PollResult::Stalled)),
                             }
                         }
                     }
@@ -1390,7 +1424,10 @@ impl<T> StoreContextMut<'_, T> {
                     // `ConcurrentState::futures` and we have nothing
                     // else to do but wait for now, so we return
                     // `Pending`.
-                    Poll::Pending => Poll::Pending,
+                    Poll::Pending => match idle {
+                        IdleBehavior::Return => Poll::Ready(Ok(PollResult::Stalled)),
+                        IdleBehavior::Wait | IdleBehavior::Trap => Poll::Pending,
+                    },
                 };
             })
             .await;
@@ -1403,7 +1440,8 @@ impl<T> StoreContextMut<'_, T> {
             match result? {
                 // The future we were passed as an argument completed, so we
                 // return the result.
-                PollResult::Complete(value) => break Ok(value),
+                PollResult::Complete(value) => break Ok(Some(value)),
+                PollResult::Stalled => break Ok(None),
                 // The future we were passed has not yet completed, so handle
                 // any work items and then loop again.
                 PollResult::ProcessWork {
